@@ -8,7 +8,8 @@ import Base.replace
 using LambertW
 using Flux
 using Flux.Tracker: update!
-using Flux: glorot_normal
+using Flux: glorot_normal, onecold
+using Distributions: Uniform
 
 ######## helper functions ########
 
@@ -30,6 +31,7 @@ function v_mem(t, ts, ws; τ::Float32=1f0)
     return v
 end
 
+# AI is used in computation of t_out
 function get_AI(ts, ws; τ::Float32=1f0)
     @assert length(ts) == length(ws)
     AI = 0
@@ -39,6 +41,7 @@ function get_AI(ts, ws; τ::Float32=1f0)
     return AI
 end
 
+# BI is used in computation of t_out
 function get_BI(ts, ws; τ::Float32=1f0)
     @assert length(ts) == length(ws)
     BI = 0
@@ -48,9 +51,18 @@ function get_BI(ts, ws; τ::Float32=1f0)
     return BI
 end
 
+# calculates the time at which a neuron spiked given its threshhold and inputs
+# returns NaN if it did not spike
 function t_out(thresh, ts, ws; τ::Float32=1f0)
     AI = get_AI(ts, ws)
     BI = get_BI(ts, ws)
+    # The derivative of the activation function at the time of a spike is
+    # equal to AI * (never negative number). Thus, if AI is negative, then
+    # any possible spike time to be calculated will be at a time when the
+    # membrane potential is decreasing, and is not a valid spike.
+    if (AI < 0) # not valid if AI is negative
+        return NaN32
+    end
     try # lambertw function throws error if argument < -e^-1 (neuron did not spike)
         t = BI/AI - (1/τ)*lambertw(-τ*(thresh/AI)*exp(τ*(BI/AI)))
         # t is only valid if it occurs later than the earliest input spike
@@ -60,6 +72,7 @@ function t_out(thresh, ts, ws; τ::Float32=1f0)
     end
 end
 
+# WI is used in computation of the derivative of t_out
 function get_WI(thresh, ts, ws; τ::Float32=1f0)
     AI = get_AI(ts, ws)
     BI = get_BI(ts, ws)
@@ -70,29 +83,10 @@ function get_WI(thresh, ts, ws; τ::Float32=1f0)
     end
 end
 
-function d_T_out_wrt_tj(thresh, ts, ws, tj, wj; τ::Float32=1f0)
-    if isnan(tj) # if presynaptic neuron j did not spike, cannot compute the derivative
-        return 0f0
-    end
-
-    fired::Array = []
-    for (i, t) in enumerate(ts)
-        if !isnan(t)  # if the value is not NaN
-            push!(fired, i) # add the index to the list of neurons that fired
-        end
-    end
-
-    ts = ts[fired] # only need the spike times of neurons that spiked
-    ws = ws[fired] # only need those weights that correspond to those times
-
-    WI = get_WI(thresh, ts, ws)
-    AI = get_AI(ts, ws)
-    BI = get_BI(ts, ws)
-    (wj*exp(tj)*(tj-(BI/AI)+WI+1))/(AI*(1+WI))
-end
-
+# returns the indices of the neurons that fired,
+# ie the indices of the array which are not NaN
 function get_fired(a::Array)
-    fired::Array = []
+    fired = Int64[]
     for (i, val) in enumerate(a)
         if !isnan(val)  # if the value is not NaN
             push!(fired, i) # add the index to the list of neurons that fired
@@ -101,6 +95,26 @@ function get_fired(a::Array)
     return fired
 end
 
+# derivative of t_out wrt a certain time
+# used for adjusting the bias
+function d_T_out_wrt_tj(thresh, ts, ws, tj, wj; τ::Float32=1f0)
+    if isnan(tj) # if presynaptic neuron j did not spike, cannot compute the derivative
+        return 0f0
+    end
+
+    fired = get_fired(ts)
+
+    ts = ts[fired] # only need the spike times of neurons that spiked
+    ws = ws[fired] # only need those weights that correspond to those times
+
+    WI = get_WI(thresh, ts, ws)
+    AI = get_AI(ts, ws)
+    BI = get_BI(ts, ws)
+
+    (wj*exp(tj)*(tj-(BI/AI)+WI+1))/(AI*(1+WI))
+end
+
+# derivative of a postsynaptic spike time wrt to a presynaptic spike time and corresponding weight
 function d_T_out_wrt_wj(thresh, ts, ws, tj; τ::Float32=1f0)
     if isnan(tj) # if presynaptic neuron j did not spike, cannot compute the derivative
         return 0f0
@@ -120,28 +134,29 @@ end
 ########## model #############
 
 mutable struct Neuron
-    weights::Array # list of connected presynaptic neurons
-    spike_time::Float32
-    error::Float32
+    weights::Array{Float32} # list of weights from connected presynaptic neurons
+    bias::Float32
 end
 
-# constructs a neuron with randomly generated weights, no spike time, and no error
+# constructs a neuron with randomly generated weights
 function Neuron(num_weights)
     ws = glorot_normal(num_weights)
-    Neuron(ws, NaN32, 0f0)
+    bias = 0f0 # rand(Uniform(0f0, 1f0), 1) # bias not used as of now
+    Neuron(ws, bias)
 end
 
-struct Model
-    layers::Array{Any,1}
+struct Model{T<:Array{Array{Neuron,1},1}}
+    layers::T
     threshhold::Float32
     input_size::Int64
     τ::Float32
 end
 
+# constructs a model with layers of neurons
 function Model(input_size::Int64, hidden_layer_sizes::Array{Int64,1}, thresh::Float32; τ::Float32=1f0)
     connections = vcat([input_size], hidden_layer_sizes[1:end-1]) # number of presynaptic inputs to each layer
-    layers = [] # create the array to hold each layer
-    # populate the each layer array with the specified number of neurons
+    layers = Array{Neuron,1}[] # create the array to hold each layer (array of arrays of neurons)
+    # populate each layer array with the specified number of neurons
     # each neuron needs a number of weights equal the number of presynaptic connections
     for (num_neurons, num_connections) in zip(hidden_layer_sizes, connections)
         push!(layers, [Neuron(num_connections) for i in 1:num_neurons])
@@ -152,35 +167,31 @@ end
 ###### Model functions ######
 
 ### Don't need AbstractArray types anymore...?
-# takes a Model and an array of inputs, returns an array of final outputs, array of outputs by layer
-function fwrd(m::Model, ts::AbstractArray)
+# takes a Model and an array of inputs, returns an array of final outputs, and array of outputs by layer for debug
+function fwd(m::Model, ts::AbstractArray)
     if length(ts) != m.input_size
         println("Size of input does not match the input layer!")
         return
     end
     input::AbstractArray = ts # starting input
-    fired::Array = [i for i in 1:length(input)] # list of presynaptic neurons that fired (all for input)
+    fired = [i for i in 1:length(input)] # list of presynaptic neurons that fired (all for input)
     out::AbstractArray = [] # list of outputs from the layer
     layer_outputs::AbstractArray = []
-        for (i, layer) in enumerate(m.layers) # for each layer in the model
+    for (i, layer) in enumerate(m.layers) # for each layer in the model
         out = [] # clear the array
         for neuron in layer # for each neuron, calculate t_out and append to outputs
-            push!(out, t_out(m.threshhold, input, neuron.weights[fired]))
+            t_with_bias = t_out(m.threshhold, input, neuron.weights[fired]) + neuron.bias
+            push!(out, t_with_bias)
         end
-        push!(layer_outputs, out) # add this layers output to the list of outputs
-        fired = [] # array to hold the indices of the neurons that fired in previous layer
-        for ind in 1:length(out) # for the index of each value the layer output
-            if !isnan(out[ind])  # if the value is not NaN
-                push!(fired, ind) # add the index to the list of neurons that fired
-            end
-        end
+        push!(layer_outputs, out) # add this layer's output to the list of outputs
+        fired = get_fired(out) # array to hold the indices of the neurons that fired in previous layer
         input = out[fired] # input to the next layer is output of this layer (only from neurons that fired)
     end
     return out, layer_outputs
 end
 
 function loss(m::Model, ts::Array, y::Array)
-    out = fwrd(m, ts)[1]
+    out = fwd(m, ts)[1]
     out = replace(out, NaN32=>100f0) # replace NaN with large number so softmax and crossentropy will work
     cat_prob = softmax([-val for val in out])
     Flux.crossentropy(cat_prob, y)
@@ -193,70 +204,86 @@ function loss(out::AbstractArray, y::Array)
     Flux.crossentropy(cat_prob, y)
 end
 
-# calculate the output then the derivative of error wrt output
+# calculate the output, then the derivative of error wrt output
+# gradient is positive for target output neuron and negative for others
 function d_error_wrt_output(m::Model, ts::Array, y::Array)
-    out = fwrd(m, ts)[1]
+    out = fwd(m, ts)[1]
     out = replace(out, NaN32=>100f0) # replace NaN with large number so softmax and crossentropy will work
     out = [-val for val in out] # make output negative so that softmax returns greatest prob. for smallest val.
     cat_prob = softmax(out)
-    ps = param(cat_prob)
-    Flux.Tracker.back!(Flux.crossentropy(ps, y))
-    Flux.Tracker.grad(ps)
+    grad = cat_prob - y
+    grad = -grad/length(y) # negative of grad bc input to softmax was negative
 end
 
-# if output has already been calculated, get derivative of error wrt output
+# derivative if output has already been calculated
+# gradient is positive for target output neuron and negative for others
 function d_error_wrt_output(out, y)
-    out = replace(out, NaN32=>100f0) # replace NaN with large number so softmax and crossentropy will work
+    out = replace(out, NaN32=>100f0) # replace NaNs with large number so softmax and crossentropy will work
     out = [-val for val in out] # make output negative so that softmax returns greatest prob. for smallest val.
     cat_prob = softmax(out)
-    ps = param(cat_prob)
-    Flux.Tracker.back!(Flux.crossentropy(ps, y))
-    Flux.Tracker.grad(ps)
+    grad = cat_prob - y
+    grad = -grad/length(y) # negative of grad bc input to softmax was negative
 end
 
 # backpropagate the errors to update all weights
+# goal: make the target neuron fire in shorter time.
+# Make non-target neurons fire in longer time.
+# make neurons that are not currently firing fire.
 function backprop!(m::Model, ts::Array, y::Array)
     @assert m.input_size==length(ts) && length(m.layers[end])==length(y)
-    out, layer_outputs = fwrd(m,ts)
+    out, layer_outputs = fwd(m,ts)
     fired = get_fired(out) # get the indices of neurons that fired
-    target_output_neuron = NaN # the output neuron whose spike time should be minimized
-    for (i, val) in enumerate(y)
-        if val == 1
-            target_output_neuron = i
-        end
-    end
+    target_output_neuron = onecold(y) # the output neuron whose spike time should be minimized
     @assert !isnan(target_output_neuron)
-    ### println("neurons that fired: ", fired) # TEST
+
+    ## println("neurons that fired: ", fired) # TEST
     ### println("derivative of error wrt output: ", d_error) # TEST
+
     # next, get the spike times of neurons in the layer before the output layer
     pst = layer_outputs[end-1] # pst (presynaptic spike times)
-    grads::Array{Float32,1} = [] # will hold the derivative of the error wrt the weights
+    grads = Float32[] # will hold the derivative of the error wrt the weights
 
     ### OUTPUT LAYER
-    for (i, neuron) in enumerate(m.layers[end]) # for the neurons in the output layer
+    dlwo = d_error_wrt_output(out, y) # derivative of loss wrt to each output
+    for (i, neuron) in enumerate(m.layers[end]) # for each neuron in the output layer
         if i in fired # if the neuron fired
-            mult = (i == target_output_neuron) ? 1 : -1
-            println("mult = ", mult)
             grads = [] # clear the grads array
-            for (j, weight) in enumerate(neuron.weights) # for each weight of the neuron
-                push!(grads, mult*d_T_out_wrt_wj(m.threshhold, pst, neuron.weights, pst[j]))
+            for (j, weight) in enumerate(neuron.weights) # for each connection to that neuron
+                push!(grads, dlwo[i]*d_T_out_wrt_wj(m.threshhold, pst, neuron.weights, pst[j]))
             end
-            println("grads for neuron ", i, " : ", grads, "\n")
-            # update!(ADAM(), neuron.weights, grads)
+            update!(ADAM(), neuron.weights, grads)
         else # neuron did not fire
-            # assign arbitrary positive value as the gradient, encouraging smaller weights
-            # smaller weights push the input spikes earlier in time, increasing chance of spike
-            grads = [100f0 for i in 1:length(m.layers[end-1])]
+            # Negative gradients so that weights become bigger.
+            # Bigger weights = larger inputs and more likely to spike
+            grads = [-100f0 for weight in neuron.weights]
             update!(ADAM(), neuron.weights, grads)
         end
     end
 
-    ### OTHER LAYERS
-#    for layer in m.layers[1:end-1]
-#        for (i, neuron) in enumerate(layer)
+"""
+plan for hidden layers: store error of each neurons output bc they
+need to be used in the calculation. gradient should be:
+d_T_out_wrt_wj() * error
+error needs to be calculated so that it reflects all the "wants" of the neurons
+in the next layer...
+"""
 
-#        end
-#    end
+    ### HIDDEN LAYERS
+    for layer in m.layers[1:end-1]
+        for (i, neuron) in enumerate(layer)
+            if i in fired # if the neuron fired
+                grads = []
+                for (j, weight) in enumerate(neuron.weights)
+                    #### stuff
+                end
+                # update weights
+            else # neuron did not fire
+                grads = [] # clear array
+                grads = [-100f0 for w in neuron.weights]
+                update!(ADAM(), neuron.weights, grads) # update the weight
+            end
+        end
+    end
 end
 
 # duplicate for viewing
@@ -265,16 +292,17 @@ function d_T_out_wrt_wj(thresh, ts, ws, tj; τ::Float32=1f0)
     AI = get_AI(ts, ws)
     BI = get_BI(ts, ws)
     (exp(tj)*(tj-(BI/AI)+WI))/(AI*(1+WI))
-end
 
-m = Model(10, [15,5], .7f0)
-ts = map(Float32, rand(10))
-y = [1,0,0,0,0]
 
-ts = map((t) -> t>.7f0 ? .1f0 : t, ts)
+ts = map(Float32, rand(10)) # random input times
+y = Int64[1,0,0,0,0] # labels
 
-function get_m!(m, ts)
-    while isempty(get_fired(fwrd(m, ts)[1]))
+ts = map((t) -> t>.7f0 ? .1f0 : t, ts) # make large ts smaller
+
+# change model params until a model gets at least one non-NaN output
+function get_m(ts)
+    m = Model(10, [15,5], .7f0) # create model with 10 inputs, 1 hidden layer, threshhold of .7
+    while isempty(get_fired(fwd(m, ts)[1]))
         m = Model(10, [15,5], .7f0)
     end
     return m
@@ -285,7 +313,7 @@ end
 # running backprop
 function test(m, ts, y)
     println("initial model output:")
-    println(fwrd(m,ts)[1], "\n")
+    println(fwd(m,ts)[1], "\n")
     println("initial output layer weights of neuron 1:")
     println(m.layers[end][1].weights, "\n")
     i = 0
@@ -303,10 +331,42 @@ function test(m, ts, y)
             println("loss changed after ", i, " backpropogations.")
             println("loss: ", new_l, "\n")
             break
-       end
+        end
    end
    println("ending model output:")
-   println(fwrd(m,ts)[1], "\n")
+   println(fwd(m,ts)[1], "\n")
    println("ending output layer weights of neuron 1:")
    println(m.layers[end][1].weights)
 end
+
+
+# Interestingly, the t_out approximation given in the paper occasionally results
+# in a positive output time even when all the weights of the neuron are
+# negative and the neuron membrane potential never exceeds zero... From looking
+# at the paper's code, I modified t_out so that if the AI argument
+# is negative then there is no spike which should fix the this problem.
+
+"""
+11/24/19
+Updating weights of output layer neurons works, except that non-target output
+neurons are encouraged to have smaller weights, which means after many backprops
+they end up fluctuating: at one fwd() they fire, but after backprop!() they no longer
+fire due to smaller weights, and after the next backprop!() they fire again after
+the weights are increased to encourage firing. Maybe test whether the neuron is
+close to not firing by checking its v_mem??
+
+I am now trying to get backprop!() working for the other hidden layers.
+"""
+
+# derivative of cross entropy and softmax,
+# from https://deepnotes.io/softmax-crossentropy#derivative-of-cross-entropy-loss-with-softmax
+def delta_cross_entropy(X,y):
+    """
+    X is the output from fully connected layer (num_examples x num_classes)
+    y is labels (num_examples x 1)
+    """
+    m = y.shape[0]
+    grad = softmax(X) # get the softmax of the output
+    grad = grad - y # subtract the target from the softmax'd output
+    grad = grad/m # divide by the number of classes
+    return grad
